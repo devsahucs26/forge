@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from "commander";
+import { doctorCommand } from "./commands/doctor.js";
 
 const program = new Command();
 
@@ -15,11 +16,6 @@ program
     console.log("Forge: initializing project...");
   });
 
-program
-  .command("doctor")
-  .description("Perform diagnostic checks on your environment")
-  .action(() => {
-    console.log("Forge: running doctor diagnostics...");
-  });
+program.addCommand(doctorCommand);
 
 program.parse();
