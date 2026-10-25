@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { doctorCommand } from "./commands/doctor.js";
+import { runCommand } from "./commands/run.js";
 
 const program = new Command();
 
@@ -17,5 +18,6 @@ program
   });
 
 program.addCommand(doctorCommand);
+program.addCommand(runCommand);
 
 program.parse();
