@@ -1,9 +1,19 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockRunOpenCode = vi.fn();
+const mockGetDefaultChecks = vi.fn();
+const mockRunChecks = vi.fn();
 
 vi.mock("../src/adapters/opencode.js", () => ({
   runOpenCode: (...args: unknown[]) => mockRunOpenCode(...args),
+}));
+
+vi.mock("../src/verification/defaults.js", () => ({
+  getDefaultChecks: (...args: unknown[]) => mockGetDefaultChecks(...args),
+}));
+
+vi.mock("../src/verification/checks.js", () => ({
+  runChecks: (...args: unknown[]) => mockRunChecks(...args),
 }));
 
 import { runTask } from "../src/commands/run.js";
@@ -17,6 +27,22 @@ describe("runTask command", () => {
     vi.clearAllMocks();
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    mockGetDefaultChecks.mockReturnValue([
+      { name: "typecheck", command: "npm", args: ["run", "typecheck"] },
+    ]);
+    mockRunChecks.mockResolvedValue([
+      {
+        name: "typecheck",
+        command: "npm",
+        args: ["run", "typecheck"],
+        status: "passed",
+        exitCode: 0,
+        durationMs: 100,
+        stdout: "",
+        stderr: "",
+      },
+    ]);
   });
 
   afterEach(() => {
@@ -24,7 +50,7 @@ describe("runTask command", () => {
     vi.restoreAllMocks();
   });
 
-  it("success: prints cleaned output, does not print error banner, sets no exit code", async () => {
+  it("success: runs verification when OpenCode succeeds and sets no error code when VERIFIED", async () => {
     mockRunOpenCode.mockResolvedValueOnce({
       success: true,
       output: "\u001b[32mSuccess: created project\u001b[0m\r\n",
@@ -38,12 +64,69 @@ describe("runTask command", () => {
       process.cwd(),
       "Create a hello world app"
     );
+    expect(mockRunChecks).toHaveBeenCalled();
     expect(logSpy).toHaveBeenCalledWith("Success: created project");
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("VERIFIED"));
     expect(errorSpy).not.toHaveBeenCalled();
     expect(process.exitCode).toBeUndefined();
   });
 
-  it("failure: prints clear failure line with cleaned error to stderr and sets exitCode to 1", async () => {
+  it("success: sets exitCode 1 when verification is FAILED", async () => {
+    mockRunOpenCode.mockResolvedValueOnce({
+      success: true,
+      output: "Done",
+      error: "",
+      timedOut: false,
+    });
+
+    mockRunChecks.mockResolvedValueOnce([
+      {
+        name: "tests",
+        command: "npm",
+        args: ["test"],
+        status: "failed",
+        exitCode: 1,
+        durationMs: 200,
+        stdout: "",
+        stderr: "Tests failed",
+      },
+    ]);
+
+    await runTask("Make changes");
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("FAILED"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("success: sets exitCode 1 when verification is UNVERIFIED", async () => {
+    mockRunOpenCode.mockResolvedValueOnce({
+      success: true,
+      output: "Done",
+      error: "",
+      timedOut: false,
+    });
+
+    mockRunChecks.mockResolvedValueOnce([
+      {
+        name: "tests",
+        command: "npm",
+        args: ["test"],
+        status: "skipped",
+        exitCode: null,
+        durationMs: 0,
+        stdout: "",
+        stderr: "",
+        skipReason: "Script not found",
+      },
+    ]);
+
+    await runTask("Make changes");
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("UNVERIFIED"));
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("failure: does NOT run verification, prints nothing was verified, sets exitCode 1", async () => {
     mockRunOpenCode.mockResolvedValueOnce({
       success: false,
       output: "",
@@ -53,15 +136,18 @@ describe("runTask command", () => {
 
     await runTask("Build the project");
 
+    expect(mockRunChecks).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalled();
-    const errorMessage = errorSpy.mock.calls[0]?.[0] as string;
-    expect(errorMessage).toContain("Task failed");
-    expect(errorMessage).toContain("Error: module not found");
-    expect(errorMessage).not.toContain("\u001b[31m");
+    const errorCalls = errorSpy.mock.calls
+      .map((c: unknown[]) => c[0] as string)
+      .join(" ");
+    expect(errorCalls).toContain("Task failed");
+    expect(errorCalls).toContain("Error: module not found");
+    expect(errorCalls).toContain("Nothing was verified");
     expect(process.exitCode).toBe(1);
   });
 
-  it("timeout: reports timed out and sets exitCode to 1", async () => {
+  it("timeout: does NOT run verification, prints nothing was verified, sets exitCode 1", async () => {
     mockRunOpenCode.mockResolvedValueOnce({
       success: false,
       output: "",
@@ -71,17 +157,22 @@ describe("runTask command", () => {
 
     await runTask("Long task that exceeds limit");
 
+    expect(mockRunChecks).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalled();
-    const errorMessage = errorSpy.mock.calls[0]?.[0] as string;
-    expect(errorMessage.toLowerCase()).toContain("timed out");
-    expect(errorMessage).toContain("Command execution killed");
+    const errorCalls = errorSpy.mock.calls
+      .map((c: unknown[]) => c[0] as string)
+      .join(" ");
+    expect(errorCalls.toLowerCase()).toContain("timed out");
+    expect(errorCalls).toContain("Command execution killed");
+    expect(errorCalls).toContain("Nothing was verified");
     expect(process.exitCode).toBe(1);
   });
 
-  it("empty task: rejects empty prompt with clear message, exitCode 1, and never calls adapter", async () => {
+  it("empty task: rejects empty prompt with clear message, exitCode 1, and never calls adapter or checks", async () => {
     await runTask("");
 
     expect(mockRunOpenCode).not.toHaveBeenCalled();
+    expect(mockRunChecks).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("cannot be empty")
     );
@@ -94,6 +185,7 @@ describe("runTask command", () => {
     await runTask("    ");
 
     expect(mockRunOpenCode).not.toHaveBeenCalled();
+    expect(mockRunChecks).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith(
       expect.stringContaining("cannot be empty")
     );

@@ -1,6 +1,9 @@
 import { Command } from "commander";
 import { runOpenCode } from "../adapters/opencode.js";
 import { stripAnsi } from "../core/text.js";
+import { getDefaultChecks } from "../verification/defaults.js";
+import { runChecks } from "../verification/checks.js";
+import { formatReport } from "../verification/report.js";
 
 export async function runTask(prompt: string): Promise<void> {
   if (!prompt || !prompt.trim()) {
@@ -29,6 +32,22 @@ export async function runTask(prompt: string): Promise<void> {
         : "Task failed.";
     }
     console.error(failureLine);
+    console.error("Nothing was verified.");
+    process.exitCode = 1;
+    return;
+  }
+
+  // After OpenCode succeeds, run verification checks
+  const checks = getDefaultChecks(process.cwd());
+  const checkResults = await runChecks(checks, process.cwd());
+  const report = formatReport(checkResults);
+  console.log(report);
+
+  const isVerified =
+    checkResults.length > 0 &&
+    checkResults.every((r) => r.status === "passed");
+
+  if (!isVerified) {
     process.exitCode = 1;
   }
 }
