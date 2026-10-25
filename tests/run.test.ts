@@ -28,7 +28,8 @@ vi.mock("../src/workspace/git.js", () => ({
   getChangedSince: (...args: unknown[]) => mockGetChangedSince(...args),
 }));
 
-import { runTask } from "../src/commands/run.js";
+import { runTask, buildRepairPrompt } from "../src/commands/run.js";
+import type { CheckResult } from "../src/verification/checks.js";
 
 describe("runTask command", () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
@@ -118,7 +119,7 @@ describe("runTask command", () => {
         expect.stringContaining("working tree is not clean")
       );
       expect(mockRunOpenCode).toHaveBeenCalled();
-      expect(process.exitCode).toBeUndefined();
+      expect(process.exitCode).toBe(0);
     });
 
     it("clean tree runs normally", async () => {
@@ -179,52 +180,16 @@ describe("runTask command", () => {
     });
   });
 
-  describe("Task execution & verification", () => {
-    it("success: runs verification when OpenCode succeeds and sets no error code when VERIFIED", async () => {
-      mockRunOpenCode.mockResolvedValueOnce({
-        success: true,
-        output: "\u001b[32mSuccess: created project\u001b[0m\r\n",
-        error: "\x1B[0m\r\n> build · auto\r\n\x1B[0m\r\n",
-        timedOut: false,
-      });
+  describe("Task execution & error handling", () => {
+    it("empty task: rejects empty prompt with clear message, exitCode 1, and never calls git or adapter", async () => {
+      await runTask("");
 
-      await runTask("Create a hello world app");
-
-      expect(mockRunOpenCode).toHaveBeenCalledWith(
-        process.cwd(),
-        "Create a hello world app"
+      expect(mockIsGitRepo).not.toHaveBeenCalled();
+      expect(mockRunOpenCode).not.toHaveBeenCalled();
+      expect(mockRunChecks).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("cannot be empty")
       );
-      expect(mockRunChecks).toHaveBeenCalled();
-      expect(logSpy).toHaveBeenCalledWith("Success: created project");
-      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("VERIFIED"));
-      expect(errorSpy).not.toHaveBeenCalled();
-      expect(process.exitCode).toBeUndefined();
-    });
-
-    it("success: sets exitCode 1 when verification is FAILED", async () => {
-      mockRunOpenCode.mockResolvedValueOnce({
-        success: true,
-        output: "Done",
-        error: "",
-        timedOut: false,
-      });
-
-      mockRunChecks.mockResolvedValueOnce([
-        {
-          name: "tests",
-          command: "npm",
-          args: ["test"],
-          status: "failed",
-          exitCode: 1,
-          durationMs: 200,
-          stdout: "",
-          stderr: "Tests failed",
-        },
-      ]);
-
-      await runTask("Make changes");
-
-      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("FAILED"));
       expect(process.exitCode).toBe(1);
     });
 
@@ -269,17 +234,321 @@ describe("runTask command", () => {
       expect(errorCalls).toContain("Nothing was verified");
       expect(process.exitCode).toBe(1);
     });
+  });
 
-    it("empty task: rejects empty prompt with clear message, exitCode 1, and never calls git or adapter", async () => {
-      await runTask("");
-
-      expect(mockIsGitRepo).not.toHaveBeenCalled();
-      expect(mockRunOpenCode).not.toHaveBeenCalled();
-      expect(mockRunChecks).not.toHaveBeenCalled();
+  describe("Bounded repair loop", () => {
+    it("invalid --max-repairs is rejected with clear error and exitCode 1", async () => {
+      await runTask("Task", { maxRepairs: -1 });
       expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("cannot be empty")
+        expect.stringContaining("--max-repairs must be an integer between 0 and 5")
       );
       expect(process.exitCode).toBe(1);
+      expect(mockRunOpenCode).not.toHaveBeenCalled();
+
+      errorSpy.mockClear();
+      process.exitCode = undefined;
+      await runTask("Task", { maxRepairs: 6 });
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("--max-repairs must be an integer between 0 and 5")
+      );
+      expect(process.exitCode).toBe(1);
+
+      errorSpy.mockClear();
+      process.exitCode = undefined;
+      await runTask("Task", { maxRepairs: "invalid" });
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("--max-repairs must be an integer between 0 and 5")
+      );
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("fails then passes after one repair gives VERIFIED", async () => {
+      mockRunOpenCode.mockResolvedValue({
+        success: true,
+        output: "Fixed code",
+        error: "",
+        timedOut: false,
+      });
+
+      // Attempt 1 fails, attempt 2 passes
+      mockRunChecks
+        .mockResolvedValueOnce([
+          {
+            name: "typecheck",
+            command: "npm",
+            args: ["run", "typecheck"],
+            status: "failed",
+            exitCode: 1,
+            durationMs: 150,
+            stdout: "",
+            stderr: "Type error: number is not string",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            name: "typecheck",
+            command: "npm",
+            args: ["run", "typecheck"],
+            status: "passed",
+            exitCode: 0,
+            durationMs: 120,
+            stdout: "",
+            stderr: "",
+          },
+        ]);
+
+      await runTask("Fix types", { maxRepairs: 2 });
+
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(2);
+      expect(mockRunChecks).toHaveBeenCalledTimes(2);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Attempt 1 of 3: checks failed, asking the agent to repair...");
+      expect(allLogs).toContain("Attempts used: 2 of 3");
+      expect(allLogs).toContain("Verdict: VERIFIED");
+      expect(process.exitCode).toBe(0);
+    });
+
+    it("always failing stops after exactly max-repairs repairs and reports FAILED", async () => {
+      mockRunOpenCode.mockResolvedValue({
+        success: true,
+        output: "Attempted fix",
+        error: "",
+        timedOut: false,
+      });
+
+      // 3 attempts total: maxRepairs = 2 -> 1 initial + 2 repairs
+      mockRunChecks
+        .mockResolvedValueOnce([
+          {
+            name: "tests",
+            command: "npm",
+            args: ["test"],
+            status: "failed",
+            exitCode: 1,
+            durationMs: 100,
+            stdout: "",
+            stderr: "Fail 1",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            name: "tests",
+            command: "npm",
+            args: ["test"],
+            status: "failed",
+            exitCode: 1,
+            durationMs: 100,
+            stdout: "",
+            stderr: "Fail 2",
+          },
+        ])
+        .mockResolvedValueOnce([
+          {
+            name: "tests",
+            command: "npm",
+            args: ["test"],
+            status: "failed",
+            exitCode: 1,
+            durationMs: 100,
+            stdout: "",
+            stderr: "Fail 3",
+          },
+        ]);
+
+      await runTask("Fix broken test", { maxRepairs: 2 });
+
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(3);
+      expect(mockRunChecks).toHaveBeenCalledTimes(3);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Attempts used: 3 of 3");
+      expect(allLogs).toContain("Verdict: FAILED");
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("--max-repairs 0 makes no repair call", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Initial run",
+        error: "",
+        timedOut: false,
+      });
+
+      mockRunChecks.mockResolvedValueOnce([
+        {
+          name: "tests",
+          command: "npm",
+          args: ["test"],
+          status: "failed",
+          exitCode: 1,
+          durationMs: 100,
+          stdout: "",
+          stderr: "Test failure",
+        },
+      ]);
+
+      await runTask("Task with no repairs", { maxRepairs: 0 });
+
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(1);
+      expect(mockRunChecks).toHaveBeenCalledTimes(1);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Attempts used: 1 of 1");
+      expect(allLogs).toContain("Verdict: FAILED");
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("UNVERIFIED triggers no repair", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Initial run",
+        error: "",
+        timedOut: false,
+      });
+
+      mockRunChecks.mockResolvedValueOnce([
+        {
+          name: "tests",
+          command: "npm",
+          args: ["test"],
+          status: "skipped",
+          exitCode: null,
+          durationMs: 0,
+          stdout: "",
+          stderr: "",
+          skipReason: "Script 'test' not found in package.json",
+        },
+      ]);
+
+      await runTask("Task without tests", { maxRepairs: 2 });
+
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(1);
+      expect(mockRunChecks).toHaveBeenCalledTimes(1);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Attempts used: 1 of 3");
+      expect(allLogs).toContain("Verdict: UNVERIFIED");
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("OpenCode failure during a repair stops", async () => {
+      mockRunOpenCode
+        .mockResolvedValueOnce({
+          success: true,
+          output: "First run OK",
+          error: "",
+          timedOut: false,
+        })
+        .mockResolvedValueOnce({
+          success: false,
+          output: "",
+          error: "API rate limit reached",
+          timedOut: false,
+        });
+
+      mockRunChecks.mockResolvedValueOnce([
+        {
+          name: "typecheck",
+          command: "npm",
+          args: ["run", "typecheck"],
+          status: "failed",
+          exitCode: 1,
+          durationMs: 100,
+          stdout: "",
+          stderr: "Syntax error",
+        },
+      ]);
+
+      await runTask("Task that fails repair", { maxRepairs: 2 });
+
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(2);
+      expect(mockRunChecks).toHaveBeenCalledTimes(1);
+
+      const allErrors = errorSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allErrors).toContain("Task failed: API rate limit reached");
+      expect(allErrors).toContain("Nothing was verified.");
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("identical failure output stops early", async () => {
+      mockRunOpenCode.mockResolvedValue({
+        success: true,
+        output: "Done",
+        error: "",
+        timedOut: false,
+      });
+
+      const sameFailure: CheckResult[] = [
+        {
+          name: "tests",
+          command: "npm",
+          args: ["test"],
+          status: "failed",
+          exitCode: 1,
+          durationMs: 100,
+          stdout: "",
+          stderr: "Same exact error output",
+        },
+      ];
+
+      // Return identical error for attempts 1 and 2
+      mockRunChecks
+        .mockResolvedValueOnce(sameFailure)
+        .mockResolvedValueOnce(sameFailure);
+
+      await runTask("Task with unchanging error", { maxRepairs: 3 });
+
+      // Should stop after 2 runs instead of continuing through all 4
+      expect(mockRunOpenCode).toHaveBeenCalledTimes(2);
+      expect(mockRunChecks).toHaveBeenCalledTimes(2);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Stopping repair loop: failure output is identical to the previous attempt");
+      expect(process.exitCode).toBe(1);
+    });
+
+    it("the repair prompt contains the original task and failed output and does not contain passed checks", () => {
+      const failedChecks: CheckResult[] = [
+        {
+          name: "tests",
+          command: "npm",
+          args: ["test"],
+          status: "failed",
+          exitCode: 1,
+          durationMs: 100,
+          stdout: "",
+          stderr: "AssertionError: expected true to be false",
+        },
+      ];
+
+      const repairPrompt = buildRepairPrompt(
+        "Build authentication flow",
+        failedChecks
+      );
+
+      expect(repairPrompt).toContain("Build authentication flow");
+      expect(repairPrompt).toContain(
+        "The following checks failed after your changes. Fix the problems. Change only what is needed, do not delete or weaken tests, and do not edit package.json scripts to make checks pass."
+      );
+      expect(repairPrompt).toContain("Check 'tests' failed:");
+      expect(repairPrompt).toContain(
+        "AssertionError: expected true to be false"
+      );
+      expect(repairPrompt).not.toContain("typecheck");
+      expect(repairPrompt).not.toContain("Check 'passed'");
     });
   });
 });
