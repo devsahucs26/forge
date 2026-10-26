@@ -10,7 +10,9 @@ import {
   getStatus,
   getHead,
   getChangedSince,
+  getCommittedSince,
 } from "../workspace/git.js";
+import type { GitStatusResult } from "../workspace/git.js";
 
 export type RunOptions = {
   allowDirty?: boolean;
@@ -64,50 +66,64 @@ export function quoteForPowerShell(filePath: string): string {
   return `'${filePath.replace(/'/g, "''")}'`;
 }
 
+export type ManualItem = {
+  path: string;
+  note?: string;
+};
+
 export type CategorizedChanges = {
   tracked: string[];
   untracked: string[];
-  manual: string[];
+  manual: ManualItem[];
 };
 
 export function categorizeChanges(
   changedFiles: string[],
-  statusData?: {
-    clean?: boolean;
-    changedFiles?: (string | { path: string; type?: string; status?: string })[];
-    trackedFiles?: string[];
-    untrackedFiles?: string[];
-    modifiedFiles?: string[];
-    deletedFiles?: string[];
-    tracked?: string[];
-    untracked?: string[];
-  } | null
+  statusData?: Partial<GitStatusResult> | null,
+  committedFiles?: string[]
 ): CategorizedChanges {
   const tracked = new Set<string>();
   const untracked = new Set<string>();
-  const manual = new Set<string>();
+  const manual: ManualItem[] = [];
 
   const knownTracked = new Set<string>();
   const knownUntracked = new Set<string>();
 
   if (statusData) {
+    if (Array.isArray(statusData.files)) {
+      for (const f of statusData.files) {
+        if (f.type === "untracked" || f.status === "??") {
+          knownUntracked.add(f.path.trim());
+        } else {
+          knownTracked.add(f.path.trim());
+        }
+      }
+    }
     if (Array.isArray(statusData.trackedFiles)) {
       for (const f of statusData.trackedFiles) knownTracked.add(f.trim());
     }
-    if (Array.isArray(statusData.tracked)) {
-      for (const f of statusData.tracked) knownTracked.add(f.trim());
+    if (Array.isArray((statusData as { tracked?: string[] }).tracked)) {
+      for (const f of (statusData as { tracked: string[] }).tracked)
+        knownTracked.add(f.trim());
     }
-    if (Array.isArray(statusData.modifiedFiles)) {
-      for (const f of statusData.modifiedFiles) knownTracked.add(f.trim());
+    if (
+      Array.isArray((statusData as { modifiedFiles?: string[] }).modifiedFiles)
+    ) {
+      for (const f of (statusData as { modifiedFiles: string[] }).modifiedFiles)
+        knownTracked.add(f.trim());
     }
-    if (Array.isArray(statusData.deletedFiles)) {
-      for (const f of statusData.deletedFiles) knownTracked.add(f.trim());
+    if (
+      Array.isArray((statusData as { deletedFiles?: string[] }).deletedFiles)
+    ) {
+      for (const f of (statusData as { deletedFiles: string[] }).deletedFiles)
+        knownTracked.add(f.trim());
     }
     if (Array.isArray(statusData.untrackedFiles)) {
       for (const f of statusData.untrackedFiles) knownUntracked.add(f.trim());
     }
-    if (Array.isArray(statusData.untracked)) {
-      for (const f of statusData.untracked) knownUntracked.add(f.trim());
+    if (Array.isArray((statusData as { untracked?: string[] }).untracked)) {
+      for (const f of (statusData as { untracked: string[] }).untracked)
+        knownUntracked.add(f.trim());
     }
 
     if (Array.isArray(statusData.changedFiles)) {
@@ -128,15 +144,16 @@ export function categorizeChanges(
             if (path) knownTracked.add(path);
           }
         } else if (item && typeof item === "object") {
-          const path = item.path?.trim();
+          const path = (item as { path?: string }).path?.trim();
           if (path) {
-            if (item.type === "untracked" || item.status === "??") {
+            const obj = item as { type?: string; status?: string };
+            if (obj.type === "untracked" || obj.status === "??") {
               knownUntracked.add(path);
             } else if (
-              item.type === "tracked" ||
-              item.type === "modified" ||
-              item.type === "deleted" ||
-              (item.status && /^[MADRC]/.test(item.status))
+              obj.type === "tracked" ||
+              obj.type === "modified" ||
+              obj.type === "deleted" ||
+              (obj.status && /^[MADRC]/.test(obj.status))
             ) {
               knownTracked.add(path);
             }
@@ -146,42 +163,47 @@ export function categorizeChanges(
     }
   }
 
+  const committedSet = new Set((committedFiles ?? []).map((f) => f.trim()));
+
   for (const rawFile of changedFiles) {
     if (typeof rawFile !== "string") continue;
     let file = rawFile.trim();
-    let inlineKind: "tracked" | "untracked" | null = null;
+
+    if (!file) continue;
+
+    const cleanPath = file.includes(" -> ")
+      ? file.split(" -> ").pop()!.trim().replace(/^["']|["']$/g, "")
+      : file.replace(/^["']|["']$/g, "");
+
+    if (committedSet.has(cleanPath)) {
+      manual.push({ path: cleanPath, note: "committed during run" });
+      continue;
+    }
 
     if (file.startsWith("??")) {
-      inlineKind = "untracked";
-      file = file.slice(2).trim().replace(/^["']|["']$/g, "");
+      untracked.add(file.slice(2).trim().replace(/^["']|["']$/g, ""));
     } else if (
       /^[MADRCU?! ][MADRCU?! ]\s+/.test(file) ||
       /^[MADRC]\s+/.test(file)
     ) {
-      inlineKind = "tracked";
       const rawPath = file.replace(/^[MADRCU?! ]+\s+/, "").trim();
-      file = rawPath.includes(" -> ")
+      const target = rawPath.includes(" -> ")
         ? rawPath.split(" -> ").pop()!.trim().replace(/^["']|["']$/g, "")
         : rawPath.replace(/^["']|["']$/g, "");
+      tracked.add(target);
+    } else if (knownUntracked.has(cleanPath)) {
+      untracked.add(cleanPath);
+    } else if (knownTracked.has(cleanPath)) {
+      tracked.add(cleanPath);
     } else {
-      file = file.replace(/^["']|["']$/g, "");
-    }
-
-    if (!file) continue;
-
-    if (inlineKind === "untracked" || knownUntracked.has(file)) {
-      untracked.add(file);
-    } else if (inlineKind === "tracked" || knownTracked.has(file)) {
-      tracked.add(file);
-    } else {
-      manual.add(file);
+      manual.push({ path: cleanPath });
     }
   }
 
   return {
     tracked: Array.from(tracked),
     untracked: Array.from(untracked),
-    manual: Array.from(manual),
+    manual,
   };
 }
 
@@ -350,12 +372,17 @@ export async function runTask(
   // Report files changed by this run
   const changedFiles = await getChangedSince(process.cwd(), startHead);
   const currentStatus = await getStatus(process.cwd());
+  const committedFiles = await getCommittedSince(process.cwd(), startHead);
 
   if (changedFiles.length === 0) {
     console.log("No files changed.");
   } else {
     console.log("Files changed by this run:");
-    const categorized = categorizeChanges(changedFiles, currentStatus);
+    const categorized = categorizeChanges(
+      changedFiles,
+      currentStatus,
+      committedFiles
+    );
 
     if (categorized.tracked.length > 0) {
       console.log("  Tracked files (modified or deleted):");
@@ -377,8 +404,12 @@ export async function runTask(
 
     if (categorized.manual.length > 0) {
       console.log("  Review manually:");
-      for (const file of categorized.manual) {
-        console.log(`    ${file}`);
+      for (const item of categorized.manual) {
+        if (item.note) {
+          console.log(`    ${item.path} (${item.note})`);
+        } else {
+          console.log(`    ${item.path}`);
+        }
       }
     }
   }

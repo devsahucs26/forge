@@ -8,6 +8,7 @@ const mockIsGitRepo = vi.fn();
 const mockGetStatus = vi.fn();
 const mockGetHead = vi.fn();
 const mockGetChangedSince = vi.fn();
+const mockGetCommittedSince = vi.fn();
 
 vi.mock("../src/adapters/opencode.js", () => ({
   runOpenCode: (...args: unknown[]) => mockRunOpenCode(...args),
@@ -26,6 +27,7 @@ vi.mock("../src/workspace/git.js", () => ({
   getStatus: (...args: unknown[]) => mockGetStatus(...args),
   getHead: (...args: unknown[]) => mockGetHead(...args),
   getChangedSince: (...args: unknown[]) => mockGetChangedSince(...args),
+  getCommittedSince: (...args: unknown[]) => mockGetCommittedSince(...args),
 }));
 
 import {
@@ -49,9 +51,16 @@ describe("runTask command", () => {
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     mockIsGitRepo.mockResolvedValue(true);
-    mockGetStatus.mockResolvedValue({ clean: true, changedFiles: [] });
+    mockGetStatus.mockResolvedValue({
+      clean: true,
+      changedFiles: [],
+      files: [],
+      trackedFiles: [],
+      untrackedFiles: [],
+    });
     mockGetHead.mockResolvedValue("head12345");
     mockGetChangedSince.mockResolvedValue([]);
+    mockGetCommittedSince.mockResolvedValue([]);
 
     mockGetDefaultChecks.mockReturnValue([
       { name: "typecheck", command: "npm", args: ["run", "typecheck"] },
@@ -236,6 +245,79 @@ describe("runTask command", () => {
         .join("\n");
       expect(allLogs).toContain("To undo: git restore 'src/it''s a tracked file.ts'");
       expect(allLogs).toContain("To undo: Remove-Item 'src/new file with spaces.ts'");
+    });
+
+    it("brand-new untracked file is classified as untracked and undoes with Remove-Item", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Created hello.txt",
+        error: "",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce(["hello.txt"]);
+      mockGetStatus
+        .mockResolvedValueOnce({
+          clean: true,
+          changedFiles: [],
+          files: [],
+          trackedFiles: [],
+          untrackedFiles: [],
+        })
+        .mockResolvedValueOnce({
+          clean: false,
+          changedFiles: ["hello.txt"],
+          trackedFiles: [],
+          untrackedFiles: ["hello.txt"],
+          files: [{ path: "hello.txt", status: "??", type: "untracked" }],
+        });
+
+      await runTask("Create hello.txt");
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Untracked files (new):");
+      expect(allLogs).toContain("hello.txt");
+      expect(allLogs).toContain("To undo: Remove-Item 'hello.txt'");
+      expect(allLogs).not.toContain("Review manually:");
+    });
+
+    it("files committed by the agent during run go under review manually with a note", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Committed changes",
+        error: "",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce(["src/committed.ts"]);
+      mockGetCommittedSince.mockResolvedValueOnce(["src/committed.ts"]);
+      mockGetStatus
+        .mockResolvedValueOnce({
+          clean: true,
+          changedFiles: [],
+          files: [],
+          trackedFiles: [],
+          untrackedFiles: [],
+        })
+        .mockResolvedValueOnce({
+          clean: true,
+          changedFiles: [],
+          files: [],
+          trackedFiles: [],
+          untrackedFiles: [],
+        });
+
+      await runTask("Commit something");
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Review manually:");
+      expect(allLogs).toContain("src/committed.ts (committed during run)");
+      expect(allLogs).not.toContain("To undo: git restore 'src/committed.ts'");
+      expect(allLogs).not.toContain("To undo: Remove-Item 'src/committed.ts'");
     });
 
     it("reports 'No files changed.' when run produced no changes", async () => {
@@ -665,12 +747,16 @@ describe("runTask command", () => {
         changedFiles: ["src/tracked.ts", "src/untracked.ts", "src/unknown.ts"],
         trackedFiles: ["src/tracked.ts"],
         untrackedFiles: ["src/untracked.ts"],
+        files: [
+          { path: "src/tracked.ts", status: " M", type: "tracked" as const },
+          { path: "src/untracked.ts", status: "??", type: "untracked" as const },
+        ],
       };
 
       const result = categorizeChanges(changed, statusData);
       expect(result.tracked).toEqual(["src/tracked.ts"]);
       expect(result.untracked).toEqual(["src/untracked.ts"]);
-      expect(result.manual).toEqual(["src/unknown.ts"]);
+      expect(result.manual).toEqual([{ path: "src/unknown.ts" }]);
     });
 
     it("categorizeChanges parses git porcelain status prefixes", () => {
@@ -683,7 +769,23 @@ describe("runTask command", () => {
       const result = categorizeChanges(changed);
       expect(result.untracked).toEqual(["src/new.ts"]);
       expect(result.tracked).toEqual(["src/modified.ts", "src/deleted.ts"]);
-      expect(result.manual).toEqual(["src/other.ts"]);
+      expect(result.manual).toEqual([{ path: "src/other.ts" }]);
+    });
+
+    it("categorizeChanges flags committed files under manual with a note", () => {
+      const changed = ["src/committed.ts", "src/untracked.ts"];
+      const statusData = {
+        clean: false,
+        changedFiles: ["src/untracked.ts"],
+        untrackedFiles: ["src/untracked.ts"],
+      };
+      const committedFiles = ["src/committed.ts"];
+
+      const result = categorizeChanges(changed, statusData, committedFiles);
+      expect(result.untracked).toEqual(["src/untracked.ts"]);
+      expect(result.manual).toEqual([
+        { path: "src/committed.ts", note: "committed during run" },
+      ]);
     });
   });
 });

@@ -31,30 +31,121 @@ export async function isGitRepo(cwd: string): Promise<boolean> {
   return out?.trim() === "true";
 }
 
-export async function getStatus(
-  cwd: string
-): Promise<{ clean: boolean; changedFiles: string[] }> {
-  const out = await execGit(cwd, ["status", "--porcelain"]);
+export type GitFileStatus = {
+  path: string;
+  status: string;
+  type: "tracked" | "untracked";
+  origPath?: string;
+};
+
+export type GitStatusResult = {
+  clean: boolean;
+  changedFiles: string[];
+  files: GitFileStatus[];
+  trackedFiles: string[];
+  untrackedFiles: string[];
+};
+
+export async function getStatus(cwd: string): Promise<GitStatusResult> {
+  const out = await execGit(cwd, [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "-uall",
+  ]);
   if (out === null) {
-    return { clean: false, changedFiles: [] };
+    return {
+      clean: false,
+      changedFiles: [],
+      files: [],
+      trackedFiles: [],
+      untrackedFiles: [],
+    };
   }
 
-  const changedFiles = out
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
+  const files: GitFileStatus[] = [];
+
+  if (out.includes("\0")) {
+    const tokens = out.split("\0");
+    let i = 0;
+    while (i < tokens.length) {
+      const token = tokens[i];
+      if (!token) {
+        i++;
+        continue;
+      }
+
+      const statusCode = token.slice(0, 2);
+      const filePath = token.slice(3);
+      if (!filePath) {
+        i++;
+        continue;
+      }
+
+      const isRenameOrCopy =
+        statusCode.includes("R") || statusCode.includes("C");
+      let origPath: string | undefined;
+      if (isRenameOrCopy && i + 1 < tokens.length) {
+        origPath = tokens[i + 1] || undefined;
+        i++;
+      }
+
+      const isUntracked = statusCode === "??";
+      files.push({
+        path: filePath,
+        status: statusCode,
+        type: isUntracked ? "untracked" : "tracked",
+        ...(origPath ? { origPath } : {}),
+      });
+
+      i++;
+    }
+  } else {
+    // Fallback for non-NUL (e.g. mocked newline-separated status output)
+    const lines = out
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      const statusCode = line.slice(0, 2);
       const pathPart = line.slice(2).trim();
-      const target = pathPart.includes(" -> ")
-        ? pathPart.split(" -> ").pop()!.trim()
-        : pathPart;
-      return target.replace(/^["']|["']$/g, "");
-    })
-    .filter(Boolean);
+      let target = pathPart;
+      let origPath: string | undefined;
+
+      if (pathPart.includes(" -> ")) {
+        const parts = pathPart.split(" -> ");
+        origPath = parts[0]?.trim().replace(/^["']|["']$/g, "");
+        target = parts[1]?.trim().replace(/^["']|["']$/g, "");
+      } else {
+        target = target.replace(/^["']|["']$/g, "");
+      }
+
+      if (!target) continue;
+      const isUntracked = statusCode === "??";
+      files.push({
+        path: target,
+        status: statusCode,
+        type: isUntracked ? "untracked" : "tracked",
+        ...(origPath ? { origPath } : {}),
+      });
+    }
+  }
+
+  const changedFiles = files.map((f) => f.path);
+  const trackedFiles = files
+    .filter((f) => f.type === "tracked")
+    .map((f) => f.path);
+  const untrackedFiles = files
+    .filter((f) => f.type === "untracked")
+    .map((f) => f.path);
 
   return {
-    clean: changedFiles.length === 0,
+    clean: files.length === 0,
     changedFiles,
+    files,
+    trackedFiles,
+    untrackedFiles,
   };
 }
 
@@ -63,18 +154,13 @@ export async function getHead(cwd: string): Promise<string | null> {
   return out ? out.trim() : null;
 }
 
-export async function getChangedSince(
+export async function getCommittedSince(
   cwd: string,
   startHead: string | null
 ): Promise<string[]> {
-  const changed = new Set<string>();
+  const committed = new Set<string>();
 
   try {
-    const status = await getStatus(cwd);
-    for (const file of status.changedFiles) {
-      changed.add(file);
-    }
-
     const currentHead = await getHead(cwd);
 
     if (startHead && currentHead && startHead !== currentHead) {
@@ -89,7 +175,7 @@ export async function getChangedSince(
           .split(/\r?\n/)
           .map((l) => l.trim())
           .filter(Boolean)) {
-          changed.add(file);
+          committed.add(file);
         }
       }
     } else if (!startHead && currentHead) {
@@ -104,9 +190,32 @@ export async function getChangedSince(
           .split(/\r?\n/)
           .map((l) => l.trim())
           .filter(Boolean)) {
-          changed.add(file);
+          committed.add(file);
         }
       }
+    }
+  } catch {
+    // Return safe default / collected files on error
+  }
+
+  return Array.from(committed);
+}
+
+export async function getChangedSince(
+  cwd: string,
+  startHead: string | null
+): Promise<string[]> {
+  const changed = new Set<string>();
+
+  try {
+    const status = await getStatus(cwd);
+    for (const file of status.changedFiles) {
+      changed.add(file);
+    }
+
+    const committed = await getCommittedSince(cwd, startHead);
+    for (const file of committed) {
+      changed.add(file);
     }
   } catch {
     // Return safe default / collected files on error

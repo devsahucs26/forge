@@ -67,18 +67,41 @@ describe("git workspace helpers", () => {
     });
 
     it("returns clean: false and parsed changed files when dirty", async () => {
-      mockExecFile.mockImplementation((_f: string, _a: string[], _o: unknown, cb?: ExecFileCallback) => {
-        const output = " M src/index.ts\r\n?? new-file.txt\r\nR  old.ts -> renamed.ts\r\n";
-        cb?.(null, output, "");
-        return mockChild;
-      });
+      let passedArgs: string[] = [];
+      mockExecFile.mockImplementation(
+        (_f: string, args: string[], _o: unknown, cb?: ExecFileCallback) => {
+          passedArgs = args;
+          const output =
+            " M src/index.ts\0?? new-file.txt\0R  renamed.ts\0old.ts\0";
+          cb?.(null, output, "");
+          return mockChild;
+        }
+      );
 
       const result = await getStatus("C:\\test\\repo");
+      expect(passedArgs).toEqual([
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "-uall",
+      ]);
       expect(result.clean).toBe(false);
       expect(result.changedFiles).toEqual([
         "src/index.ts",
         "new-file.txt",
         "renamed.ts",
+      ]);
+      expect(result.trackedFiles).toEqual(["src/index.ts", "renamed.ts"]);
+      expect(result.untrackedFiles).toEqual(["new-file.txt"]);
+      expect(result.files).toEqual([
+        { path: "src/index.ts", status: " M", type: "tracked" },
+        { path: "new-file.txt", status: "??", type: "untracked" },
+        {
+          path: "renamed.ts",
+          status: "R ",
+          type: "tracked",
+          origPath: "old.ts",
+        },
       ]);
     });
   });
@@ -160,6 +183,9 @@ describe("git workspace helpers", () => {
       await expect(getStatus("C:\\test")).resolves.toEqual({
         clean: false,
         changedFiles: [],
+        files: [],
+        trackedFiles: [],
+        untrackedFiles: [],
       });
       await expect(getHead("C:\\test")).resolves.toBeNull();
       await expect(getChangedSince("C:\\test", "somehead")).resolves.toEqual([]);
