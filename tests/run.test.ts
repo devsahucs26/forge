@@ -28,7 +28,12 @@ vi.mock("../src/workspace/git.js", () => ({
   getChangedSince: (...args: unknown[]) => mockGetChangedSince(...args),
 }));
 
-import { runTask, buildRepairPrompt } from "../src/commands/run.js";
+import {
+  runTask,
+  buildRepairPrompt,
+  quoteForPowerShell,
+  categorizeChanges,
+} from "../src/commands/run.js";
 import type { CheckResult } from "../src/verification/checks.js";
 
 describe("runTask command", () => {
@@ -136,7 +141,7 @@ describe("runTask command", () => {
       expect(errorSpy).not.toHaveBeenCalled();
     });
 
-    it("changed files reported: prints list of changed files and review/undo instructions", async () => {
+    it("changed files reported: uncategorized files listed under review manually and safe review hints printed", async () => {
       mockRunOpenCode.mockResolvedValueOnce({
         success: true,
         output: "Created file",
@@ -154,11 +159,83 @@ describe("runTask command", () => {
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
       expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Review manually:");
       expect(allLogs).toContain("src/new.ts");
       expect(allLogs).toContain("tests/new.test.ts");
-      expect(allLogs).toContain("git diff");
-      expect(allLogs).toContain("git restore .");
-      expect(allLogs).toContain("git clean -fd");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+      expect(allLogs).not.toContain("git restore .");
+      expect(allLogs).not.toContain("git clean -fd");
+    });
+
+    it("changed files split into tracked and untracked groups with PowerShell undo commands", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Updated files",
+        error: "",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce([
+        "src/modified.ts",
+        "src/untracked.ts",
+      ]);
+      mockGetStatus
+        .mockResolvedValueOnce({ clean: true, changedFiles: [] })
+        .mockResolvedValueOnce({
+          clean: false,
+          changedFiles: ["src/modified.ts", "src/untracked.ts"],
+          trackedFiles: ["src/modified.ts"],
+          untrackedFiles: ["src/untracked.ts"],
+        });
+
+      await runTask("Modify and add files");
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Tracked files (modified or deleted):");
+      expect(allLogs).toContain("src/modified.ts");
+      expect(allLogs).toContain("To undo: git restore 'src/modified.ts'");
+      expect(allLogs).toContain("Untracked files (new):");
+      expect(allLogs).toContain("src/untracked.ts");
+      expect(allLogs).toContain("To undo: Remove-Item 'src/untracked.ts'");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+      expect(allLogs).not.toContain("git restore .");
+      expect(allLogs).not.toContain("git clean -fd");
+    });
+
+    it("quotes paths for PowerShell with single quotes and escapes existing single quotes", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Updated files with tricky names",
+        error: "",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce([
+        "src/it's a tracked file.ts",
+        "src/new file with spaces.ts",
+      ]);
+      mockGetStatus
+        .mockResolvedValueOnce({ clean: true, changedFiles: [] })
+        .mockResolvedValueOnce({
+          clean: false,
+          changedFiles: [
+            "src/it's a tracked file.ts",
+            "src/new file with spaces.ts",
+          ],
+          trackedFiles: ["src/it's a tracked file.ts"],
+          untrackedFiles: ["src/new file with spaces.ts"],
+        });
+
+      await runTask("Tricky file paths");
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("To undo: git restore 'src/it''s a tracked file.ts'");
+      expect(allLogs).toContain("To undo: Remove-Item 'src/new file with spaces.ts'");
     });
 
     it("reports 'No files changed.' when run produced no changes", async () => {
@@ -176,7 +253,10 @@ describe("runTask command", () => {
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
       expect(allLogs).toContain("No files changed.");
-      expect(allLogs).toContain("git diff");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+      expect(allLogs).not.toContain("git restore .");
+      expect(allLogs).not.toContain("git clean -fd");
     });
   });
 
@@ -306,7 +386,9 @@ describe("runTask command", () => {
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
       expect(allLogs).toContain("Attempt 1 of 3: checks failed, asking the agent to repair...");
-      expect(allLogs).toContain("Attempts used: 2 of 3");
+      expect(allLogs).toContain(
+        "Agent runs: 2 (1 initial + 1 repairs, up to 2 repairs allowed)"
+      );
       expect(allLogs).toContain("Verdict: VERIFIED");
       expect(process.exitCode).toBe(0);
     });
@@ -366,7 +448,9 @@ describe("runTask command", () => {
       const allLogs = logSpy.mock.calls
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
-      expect(allLogs).toContain("Attempts used: 3 of 3");
+      expect(allLogs).toContain(
+        "Agent runs: 3 (1 initial + 2 repairs, up to 2 repairs allowed)"
+      );
       expect(allLogs).toContain("Verdict: FAILED");
       expect(process.exitCode).toBe(1);
     });
@@ -400,7 +484,9 @@ describe("runTask command", () => {
       const allLogs = logSpy.mock.calls
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
-      expect(allLogs).toContain("Attempts used: 1 of 1");
+      expect(allLogs).toContain(
+        "Agent runs: 1 (1 initial + 0 repairs, up to 0 repairs allowed)"
+      );
       expect(allLogs).toContain("Verdict: FAILED");
       expect(process.exitCode).toBe(1);
     });
@@ -435,7 +521,9 @@ describe("runTask command", () => {
       const allLogs = logSpy.mock.calls
         .map((c: unknown[]) => c[0] as string)
         .join("\n");
-      expect(allLogs).toContain("Attempts used: 1 of 3");
+      expect(allLogs).toContain(
+        "Agent runs: 1 (1 initial + 0 repairs, up to 2 repairs allowed)"
+      );
       expect(allLogs).toContain("Verdict: UNVERIFIED");
       expect(process.exitCode).toBe(1);
     });
@@ -551,4 +639,52 @@ describe("runTask command", () => {
       expect(repairPrompt).not.toContain("Check 'passed'");
     });
   });
+
+  describe("PowerShell quoting and change categorization helpers", () => {
+    it("quoteForPowerShell wraps in single quotes and doubles existing single quotes", () => {
+      expect(quoteForPowerShell("src/index.ts")).toBe("'src/index.ts'");
+      expect(quoteForPowerShell("src/path with spaces.ts")).toBe(
+        "'src/path with spaces.ts'"
+      );
+      expect(quoteForPowerShell("src/it's a test.ts")).toBe(
+        "'src/it''s a test.ts'"
+      );
+      expect(quoteForPowerShell("src/it's 'very' tricky.ts")).toBe(
+        "'src/it''s ''very'' tricky.ts'"
+      );
+    });
+
+    it("categorizeChanges splits into tracked, untracked, and manual groups", () => {
+      const changed = [
+        "src/tracked.ts",
+        "src/untracked.ts",
+        "src/unknown.ts",
+      ];
+      const statusData = {
+        clean: false,
+        changedFiles: ["src/tracked.ts", "src/untracked.ts", "src/unknown.ts"],
+        trackedFiles: ["src/tracked.ts"],
+        untrackedFiles: ["src/untracked.ts"],
+      };
+
+      const result = categorizeChanges(changed, statusData);
+      expect(result.tracked).toEqual(["src/tracked.ts"]);
+      expect(result.untracked).toEqual(["src/untracked.ts"]);
+      expect(result.manual).toEqual(["src/unknown.ts"]);
+    });
+
+    it("categorizeChanges parses git porcelain status prefixes", () => {
+      const changed = [
+        "?? src/new.ts",
+        " M src/modified.ts",
+        "D  src/deleted.ts",
+        "src/other.ts",
+      ];
+      const result = categorizeChanges(changed);
+      expect(result.untracked).toEqual(["src/new.ts"]);
+      expect(result.tracked).toEqual(["src/modified.ts", "src/deleted.ts"]);
+      expect(result.manual).toEqual(["src/other.ts"]);
+    });
+  });
 });
+

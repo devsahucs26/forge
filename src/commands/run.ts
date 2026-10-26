@@ -60,6 +60,131 @@ export function buildRepairPrompt(
   return parts.join("\n").trim();
 }
 
+export function quoteForPowerShell(filePath: string): string {
+  return `'${filePath.replace(/'/g, "''")}'`;
+}
+
+export type CategorizedChanges = {
+  tracked: string[];
+  untracked: string[];
+  manual: string[];
+};
+
+export function categorizeChanges(
+  changedFiles: string[],
+  statusData?: {
+    clean?: boolean;
+    changedFiles?: (string | { path: string; type?: string; status?: string })[];
+    trackedFiles?: string[];
+    untrackedFiles?: string[];
+    modifiedFiles?: string[];
+    deletedFiles?: string[];
+    tracked?: string[];
+    untracked?: string[];
+  } | null
+): CategorizedChanges {
+  const tracked = new Set<string>();
+  const untracked = new Set<string>();
+  const manual = new Set<string>();
+
+  const knownTracked = new Set<string>();
+  const knownUntracked = new Set<string>();
+
+  if (statusData) {
+    if (Array.isArray(statusData.trackedFiles)) {
+      for (const f of statusData.trackedFiles) knownTracked.add(f.trim());
+    }
+    if (Array.isArray(statusData.tracked)) {
+      for (const f of statusData.tracked) knownTracked.add(f.trim());
+    }
+    if (Array.isArray(statusData.modifiedFiles)) {
+      for (const f of statusData.modifiedFiles) knownTracked.add(f.trim());
+    }
+    if (Array.isArray(statusData.deletedFiles)) {
+      for (const f of statusData.deletedFiles) knownTracked.add(f.trim());
+    }
+    if (Array.isArray(statusData.untrackedFiles)) {
+      for (const f of statusData.untrackedFiles) knownUntracked.add(f.trim());
+    }
+    if (Array.isArray(statusData.untracked)) {
+      for (const f of statusData.untracked) knownUntracked.add(f.trim());
+    }
+
+    if (Array.isArray(statusData.changedFiles)) {
+      for (const item of statusData.changedFiles) {
+        if (typeof item === "string") {
+          const trimmed = item.trim();
+          if (trimmed.startsWith("??")) {
+            const path = trimmed.slice(2).trim().replace(/^["']|["']$/g, "");
+            if (path) knownUntracked.add(path);
+          } else if (
+            /^[MADRCU?! ][MADRCU?! ]\s+/.test(trimmed) ||
+            /^[MADRC]\s+/.test(trimmed)
+          ) {
+            const rawPath = trimmed.replace(/^[MADRCU?! ]+\s+/, "").trim();
+            const path = rawPath.includes(" -> ")
+              ? rawPath.split(" -> ").pop()!.trim().replace(/^["']|["']$/g, "")
+              : rawPath.replace(/^["']|["']$/g, "");
+            if (path) knownTracked.add(path);
+          }
+        } else if (item && typeof item === "object") {
+          const path = item.path?.trim();
+          if (path) {
+            if (item.type === "untracked" || item.status === "??") {
+              knownUntracked.add(path);
+            } else if (
+              item.type === "tracked" ||
+              item.type === "modified" ||
+              item.type === "deleted" ||
+              (item.status && /^[MADRC]/.test(item.status))
+            ) {
+              knownTracked.add(path);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  for (const rawFile of changedFiles) {
+    if (typeof rawFile !== "string") continue;
+    let file = rawFile.trim();
+    let inlineKind: "tracked" | "untracked" | null = null;
+
+    if (file.startsWith("??")) {
+      inlineKind = "untracked";
+      file = file.slice(2).trim().replace(/^["']|["']$/g, "");
+    } else if (
+      /^[MADRCU?! ][MADRCU?! ]\s+/.test(file) ||
+      /^[MADRC]\s+/.test(file)
+    ) {
+      inlineKind = "tracked";
+      const rawPath = file.replace(/^[MADRCU?! ]+\s+/, "").trim();
+      file = rawPath.includes(" -> ")
+        ? rawPath.split(" -> ").pop()!.trim().replace(/^["']|["']$/g, "")
+        : rawPath.replace(/^["']|["']$/g, "");
+    } else {
+      file = file.replace(/^["']|["']$/g, "");
+    }
+
+    if (!file) continue;
+
+    if (inlineKind === "untracked" || knownUntracked.has(file)) {
+      untracked.add(file);
+    } else if (inlineKind === "tracked" || knownTracked.has(file)) {
+      tracked.add(file);
+    } else {
+      manual.add(file);
+    }
+  }
+
+  return {
+    tracked: Array.from(tracked),
+    untracked: Array.from(untracked),
+    manual: Array.from(manual),
+  };
+}
+
 export async function runTask(
   prompt: string,
   options?: RunOptions
@@ -207,7 +332,10 @@ export async function runTask(
   }
 
   // Summary and final reporting
-  console.log(`Attempts used: ${attempt} of ${totalAttempts}`);
+  const repairsUsed = attempt - 1;
+  console.log(
+    `Agent runs: ${attempt} (1 initial + ${repairsUsed} repairs, up to ${maxRepairs} repairs allowed)`
+  );
   if (lastCheckResults.length > 0) {
     console.log(formatReport(lastCheckResults));
   }
@@ -221,18 +349,42 @@ export async function runTask(
 
   // Report files changed by this run
   const changedFiles = await getChangedSince(process.cwd(), startHead);
-  if (changedFiles.length > 0) {
-    console.log("Files changed by this run:");
-    for (const file of changedFiles) {
-      console.log(`  ${file}`);
-    }
-  } else {
+  const currentStatus = await getStatus(process.cwd());
+
+  if (changedFiles.length === 0) {
     console.log("No files changed.");
+  } else {
+    console.log("Files changed by this run:");
+    const categorized = categorizeChanges(changedFiles, currentStatus);
+
+    if (categorized.tracked.length > 0) {
+      console.log("  Tracked files (modified or deleted):");
+      for (const file of categorized.tracked) {
+        console.log(`    ${file}`);
+      }
+      const quoted = categorized.tracked.map(quoteForPowerShell).join(" ");
+      console.log(`  To undo: git restore ${quoted}`);
+    }
+
+    if (categorized.untracked.length > 0) {
+      console.log("  Untracked files (new):");
+      for (const file of categorized.untracked) {
+        console.log(`    ${file}`);
+      }
+      const quoted = categorized.untracked.map(quoteForPowerShell).join(", ");
+      console.log(`  To undo: Remove-Item ${quoted}`);
+    }
+
+    if (categorized.manual.length > 0) {
+      console.log("  Review manually:");
+      for (const file of categorized.manual) {
+        console.log(`    ${file}`);
+      }
+    }
   }
 
-  console.log(
-    "To review changes, run: git diff. To undo changes, run: git restore . && git clean -fd (WARNING: this will permanently discard all uncommitted changes)."
-  );
+  console.log('To review changes: git diff (and "git status" for new files).');
+  console.log("Note: Forge never runs these commands automatically.");
 }
 
 export const runCommand = new Command("run")
