@@ -207,6 +207,58 @@ export function categorizeChanges(
   };
 }
 
+export async function reportChangedFiles(
+  cwd: string,
+  startHead: string | null
+): Promise<void> {
+  const changedFiles = await getChangedSince(cwd, startHead);
+  const currentStatus = await getStatus(cwd);
+  const committedFiles = await getCommittedSince(cwd, startHead);
+
+  if (changedFiles.length === 0) {
+    console.log("No files changed.");
+  } else {
+    console.log("Files changed by this run:");
+    const categorized = categorizeChanges(
+      changedFiles,
+      currentStatus,
+      committedFiles
+    );
+
+    if (categorized.tracked.length > 0) {
+      console.log("  Tracked files (modified or deleted):");
+      for (const file of categorized.tracked) {
+        console.log(`    ${file}`);
+      }
+      const quoted = categorized.tracked.map(quoteForPowerShell).join(" ");
+      console.log(`  To undo: git restore ${quoted}`);
+    }
+
+    if (categorized.untracked.length > 0) {
+      console.log("  Untracked files (new):");
+      for (const file of categorized.untracked) {
+        console.log(`    ${file}`);
+      }
+      const quoted = categorized.untracked.map(quoteForPowerShell).join(", ");
+      console.log(`  To undo: Remove-Item ${quoted}`);
+    }
+
+    if (categorized.manual.length > 0) {
+      console.log("  Review manually:");
+      for (const item of categorized.manual) {
+        if (item.note) {
+          console.log(`    ${item.path} (${item.note})`);
+        } else {
+          console.log(`    ${item.path}`);
+        }
+      }
+    }
+  }
+
+  console.log('To review changes: git diff (and "git status" for new files).');
+  console.log("Note: Forge never runs these commands automatically.");
+}
+
 export async function runTask(
   prompt: string,
   options?: RunOptions
@@ -303,6 +355,7 @@ export async function runTask(
       console.error(failureLine);
       console.error("Nothing was verified.");
       process.exitCode = 1;
+      await reportChangedFiles(process.cwd(), startHead);
       return;
     }
 
@@ -370,52 +423,7 @@ export async function runTask(
   }
 
   // Report files changed by this run
-  const changedFiles = await getChangedSince(process.cwd(), startHead);
-  const currentStatus = await getStatus(process.cwd());
-  const committedFiles = await getCommittedSince(process.cwd(), startHead);
-
-  if (changedFiles.length === 0) {
-    console.log("No files changed.");
-  } else {
-    console.log("Files changed by this run:");
-    const categorized = categorizeChanges(
-      changedFiles,
-      currentStatus,
-      committedFiles
-    );
-
-    if (categorized.tracked.length > 0) {
-      console.log("  Tracked files (modified or deleted):");
-      for (const file of categorized.tracked) {
-        console.log(`    ${file}`);
-      }
-      const quoted = categorized.tracked.map(quoteForPowerShell).join(" ");
-      console.log(`  To undo: git restore ${quoted}`);
-    }
-
-    if (categorized.untracked.length > 0) {
-      console.log("  Untracked files (new):");
-      for (const file of categorized.untracked) {
-        console.log(`    ${file}`);
-      }
-      const quoted = categorized.untracked.map(quoteForPowerShell).join(", ");
-      console.log(`  To undo: Remove-Item ${quoted}`);
-    }
-
-    if (categorized.manual.length > 0) {
-      console.log("  Review manually:");
-      for (const item of categorized.manual) {
-        if (item.note) {
-          console.log(`    ${item.path} (${item.note})`);
-        } else {
-          console.log(`    ${item.path}`);
-        }
-      }
-    }
-  }
-
-  console.log('To review changes: git diff (and "git status" for new files).');
-  console.log("Note: Forge never runs these commands automatically.");
+  await reportChangedFiles(process.cwd(), startHead);
 }
 
 export const runCommand = new Command("run")

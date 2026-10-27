@@ -396,6 +396,108 @@ describe("runTask command", () => {
       expect(errorCalls).toContain("Nothing was verified");
       expect(process.exitCode).toBe(1);
     });
+
+    it("OpenCode timeout with a new untracked file still prints the file and 'To undo: Remove-Item ...'", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: false,
+        output: "Partial output before timeout",
+        error: "Execution timed out after 300000ms",
+        timedOut: true,
+      });
+      mockGetChangedSince.mockResolvedValueOnce(["temp-created.txt"]);
+      mockGetStatus
+        .mockResolvedValueOnce({ clean: true, changedFiles: [] })
+        .mockResolvedValueOnce({
+          clean: false,
+          changedFiles: ["temp-created.txt"],
+          trackedFiles: [],
+          untrackedFiles: ["temp-created.txt"],
+          files: [{ path: "temp-created.txt", status: "??", type: "untracked" }],
+        });
+
+      await runTask("Task that times out");
+
+      expect(mockRunChecks).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+      const errorCalls = errorSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join(" ");
+      expect(errorCalls.toLowerCase()).toContain("timed out");
+      expect(errorCalls).toContain("Nothing was verified");
+      expect(process.exitCode).toBe(1);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Untracked files (new):");
+      expect(allLogs).toContain("temp-created.txt");
+      expect(allLogs).toContain("To undo: Remove-Item 'temp-created.txt'");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+    });
+
+    it("OpenCode failure with a modified tracked file prints 'git restore ...'", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: false,
+        output: "Error log",
+        error: "Compilation failed",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce(["src/index.ts"]);
+      mockGetStatus
+        .mockResolvedValueOnce({ clean: true, changedFiles: [] })
+        .mockResolvedValueOnce({
+          clean: false,
+          changedFiles: ["src/index.ts"],
+          trackedFiles: ["src/index.ts"],
+          untrackedFiles: [],
+          files: [{ path: "src/index.ts", status: " M", type: "tracked" }],
+        });
+
+      await runTask("Task that fails");
+
+      expect(mockRunChecks).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalled();
+      const errorCalls = errorSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join(" ");
+      expect(errorCalls).toContain("Task failed");
+      expect(errorCalls).toContain("Nothing was verified");
+      expect(process.exitCode).toBe(1);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("Files changed by this run:");
+      expect(allLogs).toContain("Tracked files (modified or deleted):");
+      expect(allLogs).toContain("src/index.ts");
+      expect(allLogs).toContain("To undo: git restore 'src/index.ts'");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+    });
+
+    it("failure with no changes prints 'No files changed.'", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: false,
+        output: "",
+        error: "General failure",
+        timedOut: false,
+      });
+      mockGetChangedSince.mockResolvedValueOnce([]);
+
+      await runTask("Task that fails with no changes");
+
+      expect(mockRunChecks).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(1);
+
+      const allLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allLogs).toContain("No files changed.");
+      expect(allLogs).toContain('To review changes: git diff (and "git status" for new files).');
+      expect(allLogs).toContain("Note: Forge never runs these commands automatically.");
+    });
   });
 
   describe("Bounded repair loop", () => {
