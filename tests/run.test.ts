@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { saveRunReport, redact, type RunReport } from "../src/core/run-store.js";
 
 const mockRunOpenCode = vi.fn();
 const mockGetDefaultChecks = vi.fn();
@@ -888,6 +892,320 @@ describe("runTask command", () => {
       expect(result.manual).toEqual([
         { path: "src/committed.ts", note: "committed during run" },
       ]);
+    });
+  });
+
+  describe("Run reports and redaction", () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "forge-test-run-report-"));
+    });
+
+    afterEach(() => {
+      if (tmpDir && fs.existsSync(tmpDir)) {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    });
+
+    it("saveRunReport writes valid JSON at the expected path", () => {
+      const report: RunReport = {
+        id: "20261028T013000Z-ab12cd",
+        task: "Implement unit tests",
+        startedAt: "2026-10-28T01:30:00.000Z",
+        finishedAt: "2026-10-28T01:30:05.000Z",
+        options: { allowDirty: false, maxRepairs: 2 },
+        startHead: "head123",
+        attempts: [
+          {
+            number: 1,
+            kind: "initial",
+            agentSuccess: true,
+            timedOut: false,
+            durationMs: 5000,
+            checks: [
+              {
+                name: "typecheck",
+                status: "passed",
+                exitCode: 0,
+                durationMs: 120,
+                outputTail: "Clean typecheck",
+              },
+            ],
+          },
+        ],
+        verdict: "VERIFIED",
+        changedFiles: ["src/feature.ts"],
+        exitCode: 0,
+      };
+
+      const expectedPath = path.join(
+        tmpDir,
+        ".forge",
+        "runs",
+        "20261028T013000Z-ab12cd",
+        "report.json"
+      );
+      const savedPath = saveRunReport(tmpDir, report);
+
+      expect(savedPath).toBe(expectedPath);
+      expect(fs.existsSync(expectedPath)).toBe(true);
+
+      const parsed = JSON.parse(fs.readFileSync(expectedPath, "utf-8"));
+      expect(parsed.id).toBe("20261028T013000Z-ab12cd");
+      expect(parsed.task).toBe("Implement unit tests");
+      expect(parsed.verdict).toBe("VERIFIED");
+      expect(parsed.exitCode).toBe(0);
+      expect(parsed.attempts).toHaveLength(1);
+      expect(parsed.attempts[0].checks[0].name).toBe("typecheck");
+    });
+
+    it("redaction masks the patterns above and leaves normal text alone", () => {
+      // sk- style keys
+      expect(redact("sk-proj-abc1234567890xyz")).toBe("[REDACTED]");
+      expect(redact("API key is sk-123456789")).toBe("API key is [REDACTED]");
+      expect(redact("sk_live_9876543210")).toBe("[REDACTED]");
+
+      // Bearer <token>
+      expect(redact("Authorization: Bearer secret-token-xyz")).toBe(
+        "Authorization: Bearer [REDACTED]"
+      );
+      expect(redact("Bearer my_jwt_token_12345")).toBe("Bearer [REDACTED]");
+
+      // ghp_ and github_pat_ tokens
+      expect(redact("Token: ghp_123456789012345678901234567890123456")).toBe(
+        "Token: [REDACTED]"
+      );
+      expect(redact("github_pat_11ABCD_1234567890abcdef")).toBe("[REDACTED]");
+
+      // KEY/TOKEN/SECRET/PASSWORD assignments like API_KEY=abc
+      expect(redact("API_KEY=my_secret_key")).toBe("API_KEY=[REDACTED]");
+      expect(redact("SECRET=my_super_secret")).toBe("SECRET=[REDACTED]");
+      expect(redact("TOKEN=auth_token_999")).toBe("TOKEN=[REDACTED]");
+      expect(redact("PASSWORD=db_password_123")).toBe("PASSWORD=[REDACTED]");
+      expect(redact("DB_PASSWORD='quoted_secret'")).toBe("DB_PASSWORD=[REDACTED]");
+      expect(redact('CLIENT_SECRET="double_quoted"')).toBe("CLIENT_SECRET=[REDACTED]");
+      expect(redact("api_key=lowercase_secret")).toBe("api_key=[REDACTED]");
+
+      // Normal text alone
+      expect(redact("This is normal text without any credentials.")).toBe(
+        "This is normal text without any credentials."
+      );
+      expect(redact("Everything passed successfully.")).toBe(
+        "Everything passed successfully."
+      );
+      expect(redact("Primary key is id in users table.")).toBe(
+        "Primary key is id in users table."
+      );
+      expect(redact("keyword arguments in python")).toBe(
+        "keyword arguments in python"
+      );
+      expect(redact("monkey=banana")).toBe("monkey=banana");
+    });
+
+    it("outputTail is truncated to 2000 characters", () => {
+      const longOutput = "\u001b[31m" + "X".repeat(3000) + "\u001b[0m";
+      const report: RunReport = {
+        id: "20261028T013000Z-longtail",
+        task: "Check tail length",
+        startedAt: "2026-10-28T01:30:00.000Z",
+        finishedAt: "2026-10-28T01:30:01.000Z",
+        options: { allowDirty: false, maxRepairs: 0 },
+        startHead: "head123",
+        attempts: [
+          {
+            number: 1,
+            kind: "initial",
+            agentSuccess: true,
+            timedOut: false,
+            durationMs: 1000,
+            checks: [
+              {
+                name: "longcheck",
+                status: "failed",
+                exitCode: 1,
+                durationMs: 50,
+                outputTail: longOutput,
+              },
+            ],
+          },
+        ],
+        verdict: "FAILED",
+        changedFiles: [],
+        exitCode: 1,
+      };
+
+      const savedPath = saveRunReport(tmpDir, report);
+      expect(savedPath).toBeTruthy();
+
+      const parsed = JSON.parse(fs.readFileSync(savedPath!, "utf-8"));
+      const tail = parsed.attempts[0].checks[0].outputTail;
+      expect(tail.length).toBe(2000);
+      expect(tail).toBe("X".repeat(2000));
+      expect(tail).not.toContain("\u001b[31m");
+    });
+
+    it("a write failure returns null and does not throw", () => {
+      const badTarget = path.join(tmpDir, "file_blocking_dir");
+      fs.writeFileSync(badTarget, "I am a file, not a directory");
+
+      const report: RunReport = {
+        id: "fail-test",
+        task: "Test failure",
+        startedAt: "2026-10-28T01:30:00.000Z",
+        finishedAt: "2026-10-28T01:30:01.000Z",
+        options: { allowDirty: false, maxRepairs: 0 },
+        startHead: null,
+        attempts: [],
+        verdict: "UNVERIFIED",
+        changedFiles: [],
+        exitCode: 1,
+      };
+
+      expect(() => {
+        const result = saveRunReport(badTarget, report);
+        expect(result).toBeNull();
+      }).not.toThrow();
+    });
+
+    it("runTask saves a report with VERIFIED verdict on success", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Code generated cleanly",
+        error: "",
+        timedOut: false,
+      });
+      mockRunChecks.mockResolvedValueOnce([
+        {
+          name: "typecheck",
+          command: "npm",
+          args: ["run", "typecheck"],
+          status: "passed",
+          exitCode: 0,
+          durationMs: 50,
+          stdout: "ok",
+          stderr: "",
+        },
+      ]);
+
+      await runTask("Build login page", { cwd: tmpDir });
+      expect(process.exitCode).toBe(0);
+
+      const runsDir = path.join(tmpDir, ".forge", "runs");
+      expect(fs.existsSync(runsDir)).toBe(true);
+      const runFolders = fs.readdirSync(runsDir);
+      expect(runFolders).toHaveLength(1);
+
+      const successReportPath = path.join(runsDir, runFolders[0], "report.json");
+      expect(fs.existsSync(successReportPath)).toBe(true);
+      const successReport = JSON.parse(
+        fs.readFileSync(successReportPath, "utf-8")
+      );
+      expect(successReport.verdict).toBe("VERIFIED");
+      expect(successReport.exitCode).toBe(0);
+      expect(successReport.attempts).toHaveLength(1);
+      expect(successReport.attempts[0].agentSuccess).toBe(true);
+      expect(successReport.attempts[0].timedOut).toBe(false);
+
+      const allSuccessLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allSuccessLogs).toContain(`Run report saved: ${successReportPath}`);
+    });
+
+    it("runTask saves a report with FAILED verdict on failure", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: true,
+        output: "Code with bug",
+        error: "",
+        timedOut: false,
+      });
+      mockRunChecks.mockResolvedValueOnce([
+        {
+          name: "tests",
+          command: "npm",
+          args: ["test"],
+          status: "failed",
+          exitCode: 1,
+          durationMs: 80,
+          stdout: "",
+          stderr: "Expected 1 to be 2",
+        },
+      ]);
+
+      await runTask("Fix broken test", { cwd: tmpDir, maxRepairs: 0 });
+      expect(process.exitCode).toBe(1);
+
+      const failRunsDir = path.join(tmpDir, ".forge", "runs");
+      const failFolders = fs.readdirSync(failRunsDir);
+      expect(failFolders).toHaveLength(1);
+
+      const failureReportPath = path.join(
+        failRunsDir,
+        failFolders[0],
+        "report.json"
+      );
+      const failureReport = JSON.parse(
+        fs.readFileSync(failureReportPath, "utf-8")
+      );
+      expect(failureReport.verdict).toBe("FAILED");
+      expect(failureReport.exitCode).toBe(1);
+      expect(failureReport.attempts).toHaveLength(1);
+      expect(failureReport.attempts[0].checks[0].status).toBe("failed");
+
+      const allFailLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allFailLogs).toContain(`Run report saved: ${failureReportPath}`);
+    });
+
+    it("runTask saves a report with AGENT_FAILED verdict on OpenCode timeout (mocked)", async () => {
+      mockRunOpenCode.mockResolvedValueOnce({
+        success: false,
+        output: "",
+        error: "agent process timed out",
+        timedOut: true,
+      });
+
+      await runTask("Long running task", { cwd: tmpDir });
+      expect(process.exitCode).toBe(1);
+
+      const timeoutRunsDir = path.join(tmpDir, ".forge", "runs");
+      const timeoutFolders = fs.readdirSync(timeoutRunsDir);
+      expect(timeoutFolders).toHaveLength(1);
+
+      const timeoutReportPath = path.join(
+        timeoutRunsDir,
+        timeoutFolders[0],
+        "report.json"
+      );
+      const timeoutReport = JSON.parse(
+        fs.readFileSync(timeoutReportPath, "utf-8")
+      );
+      expect(timeoutReport.verdict).toBe("AGENT_FAILED");
+      expect(timeoutReport.exitCode).toBe(1);
+      expect(timeoutReport.attempts).toHaveLength(1);
+      expect(timeoutReport.attempts[0].agentSuccess).toBe(false);
+      expect(timeoutReport.attempts[0].timedOut).toBe(true);
+
+      const allTimeoutLogs = logSpy.mock.calls
+        .map((c: unknown[]) => c[0] as string)
+        .join("\n");
+      expect(allTimeoutLogs).toContain(`Run report saved: ${timeoutReportPath}`);
+    });
+
+    it("runTask saves no report when refused because the tree is dirty", async () => {
+      mockGetStatus.mockResolvedValueOnce({
+        clean: false,
+        changedFiles: ["dirty_file.ts"],
+      });
+
+      await runTask("Should refuse", { cwd: tmpDir });
+      expect(process.exitCode).toBe(1);
+      expect(mockRunOpenCode).not.toHaveBeenCalled();
+
+      // No .forge directory should be created
+      expect(fs.existsSync(path.join(tmpDir, ".forge"))).toBe(false);
     });
   });
 });

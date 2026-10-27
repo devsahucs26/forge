@@ -13,10 +13,18 @@ import {
   getCommittedSince,
 } from "../workspace/git.js";
 import type { GitStatusResult } from "../workspace/git.js";
+import {
+  saveRunReport,
+  generateRunId,
+  type AttemptSummary,
+  type CheckSummary,
+  type RunReport,
+} from "../core/run-store.js";
 
 export type RunOptions = {
   allowDirty?: boolean;
   maxRepairs?: string | number;
+  cwd?: string;
 };
 
 export function getVerdict(
@@ -289,14 +297,15 @@ export async function runTask(
     maxRepairs = parsed;
   }
 
-  const isRepo = await isGitRepo(process.cwd());
+  const cwd = options?.cwd ?? process.cwd();
+  const isRepo = await isGitRepo(cwd);
   if (!isRepo) {
     console.error("Error: current directory is not a git repository.");
     process.exitCode = 1;
     return;
   }
 
-  const status = await getStatus(process.cwd());
+  const status = await getStatus(cwd);
   if (!status.clean) {
     if (!options?.allowDirty) {
       console.error(
@@ -317,8 +326,9 @@ export async function runTask(
     }
   }
 
-  const startHead = await getHead(process.cwd());
+  const startHead = await getHead(cwd);
   const runStartTime = Date.now();
+  const startedAt = new Date(runStartTime).toISOString();
   const MAX_RUN_TIME_MS = 15 * 60 * 1000;
 
   const totalAttempts = 1 + maxRepairs;
@@ -326,6 +336,36 @@ export async function runTask(
   let lastFailureKey: string | null = null;
   let lastCheckResults: CheckResult[] = [];
   let currentPrompt = prompt;
+  const attempts: AttemptSummary[] = [];
+
+  const finalizeAndSaveReport = async (
+    verdict: "VERIFIED" | "FAILED" | "UNVERIFIED" | "AGENT_FAILED",
+    exitCode: number
+  ) => {
+    const finishedAt = new Date().toISOString();
+    const changedFiles = await getChangedSince(cwd, startHead);
+    const report: RunReport = {
+      id: generateRunId(),
+      task: prompt,
+      startedAt,
+      finishedAt,
+      options: {
+        allowDirty: Boolean(options?.allowDirty),
+        maxRepairs,
+      },
+      startHead,
+      attempts,
+      verdict,
+      changedFiles,
+      exitCode,
+    };
+    const savedPath = saveRunReport(cwd, report);
+    if (savedPath) {
+      console.log(`Run report saved: ${savedPath}`);
+    } else {
+      console.log("Run report could not be saved.");
+    }
+  };
 
   while (attempt <= totalAttempts) {
     if (Date.now() - runStartTime >= MAX_RUN_TIME_MS) {
@@ -333,7 +373,12 @@ export async function runTask(
       break;
     }
 
-    const result = await runOpenCode(process.cwd(), currentPrompt);
+    const attemptNumber = attempt;
+    const attemptKind: "initial" | "repair" =
+      attempt === 1 ? "initial" : "repair";
+    const attemptStart = Date.now();
+
+    const result = await runOpenCode(cwd, currentPrompt);
 
     const cleanedOutput = stripAnsi(result.output).trim();
     if (cleanedOutput) {
@@ -341,6 +386,16 @@ export async function runTask(
     }
 
     if (!result.success) {
+      const attemptDuration = Date.now() - attemptStart;
+      attempts.push({
+        number: attemptNumber,
+        kind: attemptKind,
+        agentSuccess: false,
+        timedOut: Boolean(result.timedOut),
+        durationMs: attemptDuration,
+        checks: [],
+      });
+
       const cleanedError = stripAnsi(result.error).trim();
       let failureLine: string;
       if (result.timedOut) {
@@ -355,14 +410,40 @@ export async function runTask(
       console.error(failureLine);
       console.error("Nothing was verified.");
       process.exitCode = 1;
-      await reportChangedFiles(process.cwd(), startHead);
+      await reportChangedFiles(cwd, startHead);
+      await finalizeAndSaveReport("AGENT_FAILED", 1);
       return;
     }
 
     // Run verification checks
-    const checks = getDefaultChecks(process.cwd());
-    const checkResults = await runChecks(checks, process.cwd());
+    const checks = getDefaultChecks(cwd);
+    const checkResults = await runChecks(checks, cwd);
     lastCheckResults = checkResults;
+    const attemptDuration = Date.now() - attemptStart;
+
+    const checkSummaries: CheckSummary[] = checkResults.map((c) => {
+      const raw = [c.stdout, c.stderr].filter(Boolean).join("\n");
+      const stripped = stripAnsi(raw);
+      const outputTail =
+        stripped.length > 2000 ? stripped.slice(-2000) : stripped;
+      return {
+        name: c.name,
+        status: c.status,
+        exitCode: c.exitCode ?? null,
+        durationMs: c.durationMs,
+        outputTail,
+      };
+    });
+
+    attempts.push({
+      number: attemptNumber,
+      kind: attemptKind,
+      agentSuccess: true,
+      timedOut: false,
+      durationMs: attemptDuration,
+      checks: checkSummaries,
+    });
+
     const verdict = getVerdict(checkResults);
 
     if (verdict === "VERIFIED") {
@@ -416,6 +497,7 @@ export async function runTask(
   }
 
   const finalVerdict = getVerdict(lastCheckResults);
+  const exitCode = finalVerdict === "VERIFIED" ? 0 : 1;
   if (finalVerdict === "VERIFIED") {
     process.exitCode = 0;
   } else {
@@ -423,7 +505,11 @@ export async function runTask(
   }
 
   // Report files changed by this run
-  await reportChangedFiles(process.cwd(), startHead);
+  await reportChangedFiles(cwd, startHead);
+
+  if (attempts.length > 0) {
+    await finalizeAndSaveReport(finalVerdict, exitCode);
+  }
 }
 
 export const runCommand = new Command("run")
