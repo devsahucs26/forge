@@ -1,8 +1,15 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { saveRunReport, redact, type RunReport } from "../src/core/run-store.js";
+
+const realRepoRoot = path.resolve(fileURLToPath(import.meta.url), "../..");
+const realRunsDir = path.join(realRepoRoot, ".forge", "runs");
+const initialRunsSnapshot = fs.existsSync(realRunsDir)
+  ? fs.readdirSync(realRunsDir)
+  : [];
 
 const mockRunOpenCode = vi.fn();
 const mockGetDefaultChecks = vi.fn();
@@ -46,10 +53,13 @@ describe("runTask command", () => {
   let logSpy: ReturnType<typeof vi.spyOn>;
   let errorSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
+  let testCwd: string;
 
   beforeEach(() => {
     process.exitCode = undefined;
     vi.clearAllMocks();
+    testCwd = fs.mkdtempSync(path.join(os.tmpdir(), "forge-run-test-cwd-"));
+    vi.spyOn(process, "cwd").mockReturnValue(testCwd);
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -86,6 +96,23 @@ describe("runTask command", () => {
   afterEach(() => {
     process.exitCode = undefined;
     vi.restoreAllMocks();
+    if (testCwd && fs.existsSync(testCwd)) {
+      try {
+        fs.rmSync(testCwd, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup error
+      }
+    }
+  });
+
+  afterAll(() => {
+    const currentEntries = fs.existsSync(realRunsDir)
+      ? fs.readdirSync(realRunsDir)
+      : [];
+    expect(
+      currentEntries,
+      "The test suite created or modified files in the real .forge/runs folder!"
+    ).toEqual(initialRunsSnapshot);
   });
 
   describe("Git safety", () => {
@@ -900,11 +927,16 @@ describe("runTask command", () => {
 
     beforeEach(() => {
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "forge-test-run-report-"));
+      vi.spyOn(process, "cwd").mockReturnValue(tmpDir);
     });
 
     afterEach(() => {
       if (tmpDir && fs.existsSync(tmpDir)) {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup error
+        }
       }
     });
 
@@ -1207,6 +1239,18 @@ describe("runTask command", () => {
       // No .forge directory should be created
       expect(fs.existsSync(path.join(tmpDir, ".forge"))).toBe(false);
     });
+  });
+});
+
+describe("Guard: Real project .forge/runs isolation", () => {
+  it("verifies the real .forge/runs folder was not modified by the test suite", () => {
+    const currentEntries = fs.existsSync(realRunsDir)
+      ? fs.readdirSync(realRunsDir)
+      : [];
+    expect(
+      currentEntries,
+      "The test suite created or modified files in the real .forge/runs folder!"
+    ).toEqual(initialRunsSnapshot);
   });
 });
 
