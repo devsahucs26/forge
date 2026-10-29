@@ -15,12 +15,10 @@ You give it a task in plain English. Forge hands the task to OpenCode, then runs
 | `forge doctor` | Checks that Node.js, npm, Git and OpenCode are installed and runnable, and prints their versions. |
 | `forge run "<task>"` | Runs a task through OpenCode, verifies the result, repairs failures within a limit, and reports exactly which files changed. |
 
-`forge init` exists as a placeholder and does nothing yet.
-
 ### How `forge run` works
 
 1. **Safety check.** It refuses to start unless the folder is a Git repository with a clean working tree (override with `--allow-dirty`), so every change the agent makes is visible in `git diff`.
-2. **Agent run.** It calls `opencode run` with your task. The prompt is passed as a single argument and never goes through a shell.
+2. **Plan and agent run.** It asks OpenCode to inspect repository instructions, create a concise plan with explicit acceptance criteria, implement the task, run checks, and review the diff. The prompt is passed as a single argument and never goes through a shell.
 3. **Verification.** It runs `npm run typecheck` and `npm test` itself and records the real exit codes and output. Missing scripts are reported as skipped, never as passed.
 4. **Bounded repair.** If a check fails, it sends the failure details back to the agent for up to `--max-repairs` attempts (default 2, maximum 5). It stops early if a repair makes no progress, or after 15 minutes in total.
 5. **Report.** It prints a verdict, the files the run changed, and the exact commands you could use to undo the change. Forge never runs those commands itself. It also saves a JSON report of the run under `.forge/runs/`.
@@ -68,6 +66,12 @@ Run Forge from the root of the project you want to change:
 npm run dev -- run "Add a function add(a, b) in src/math.ts and a unit test for it"
 ```
 
+Initialize Forge configuration in a project:
+
+```bash
+npm run dev -- init
+```
+
 Until a `forge` binary is packaged, the `npm run dev -- ...` form is how you run it.
 
 ## Safety model
@@ -80,6 +84,9 @@ Forge executes code and lets an AI edit your files, so it is conservative by def
 - It reports changed files even when the agent fails or times out.
 - Run reports redact common secret patterns (API keys, bearer tokens, `KEY=`/`TOKEN=`/`PASSWORD=` assignments) and store only a short tail of each check's output, not the agent's full output. Redaction is pattern-based and not a guarantee, so don't share reports without reading them.
 - `.forge/` is listed in `.gitignore`. Keep it there.
+
+`forge init` creates `.forge/config.json` with conservative planning and execution
+defaults. The file is local configuration and is ignored by Git.
 
 **What `VERIFIED` means.** Only that your type check and tests passed. It does not prove the change is correct if the tests don't cover it. Review the diff.
 
@@ -112,7 +119,7 @@ Planned, in rough order. None of this is promised or dated.
 
 - `forge status` and `forge report` to read saved run reports
 - Record the model, provider and tool versions in each report
-- `forge init` with a per-project config file, including custom checks
+- Custom checks in the per-project config file
 - Model and provider listing
 - Curated skills, MCP servers and profiles, installed only with your approval
 - A benchmark suite to measure whether extra orchestration (planning, multi-agent roles) actually beats a single agent before any of it becomes a default

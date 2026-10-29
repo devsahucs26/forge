@@ -1,5 +1,6 @@
 import { Command } from "commander";
 import { runOpenCode } from "../adapters/opencode.js";
+import { loadForgeConfig } from "../core/config.js";
 import { stripAnsi } from "../core/text.js";
 import { getDefaultChecks } from "../verification/defaults.js";
 import { runChecks } from "../verification/checks.js";
@@ -26,6 +27,22 @@ export type RunOptions = {
   maxRepairs?: string | number;
   cwd?: string;
 };
+
+export function buildTaskPrompt(
+  task: string,
+  requireAcceptanceCriteria: boolean
+): string {
+  if (!requireAcceptanceCriteria) return task;
+
+  return [
+    "Work autonomously on the following task.",
+    "First inspect the repository instructions and formulate a concise implementation plan with explicit acceptance criteria.",
+    "Then implement the plan, run the relevant checks, and review the final diff.",
+    "Do not claim success unless the checks actually pass.",
+    "",
+    `Task: ${task}`,
+  ].join("\n");
+}
 
 export function getVerdict(
   results: CheckResult[]
@@ -277,7 +294,9 @@ export async function runTask(
     return;
   }
 
-  let maxRepairs = 2;
+  const cwd = options?.cwd ?? process.cwd();
+  const config = loadForgeConfig(cwd);
+  let maxRepairs = config.execution.maxRepairs;
   if (options?.maxRepairs !== undefined) {
     const rawVal = options.maxRepairs;
     const parsed =
@@ -297,7 +316,6 @@ export async function runTask(
     maxRepairs = parsed;
   }
 
-  const cwd = options?.cwd ?? process.cwd();
   const isRepo = await isGitRepo(cwd);
   if (!isRepo) {
     console.error("Error: current directory is not a git repository.");
@@ -329,13 +347,16 @@ export async function runTask(
   const startHead = await getHead(cwd);
   const runStartTime = Date.now();
   const startedAt = new Date(runStartTime).toISOString();
-  const MAX_RUN_TIME_MS = 15 * 60 * 1000;
+  const MAX_RUN_TIME_MS = config.execution.maxRunMinutes * 60 * 1000;
 
   const totalAttempts = 1 + maxRepairs;
   let attempt = 1;
   let lastFailureKey: string | null = null;
   let lastCheckResults: CheckResult[] = [];
-  let currentPrompt = prompt;
+  let currentPrompt = buildTaskPrompt(
+    prompt,
+    config.planning.requireAcceptanceCriteria
+  );
   const attempts: AttemptSummary[] = [];
 
   const finalizeAndSaveReport = async (
@@ -369,7 +390,9 @@ export async function runTask(
 
   while (attempt <= totalAttempts) {
     if (Date.now() - runStartTime >= MAX_RUN_TIME_MS) {
-      console.error("Error: maximum run duration of 15 minutes exceeded.");
+      console.error(
+        `Error: maximum run duration of ${config.execution.maxRunMinutes} minutes exceeded.`
+      );
       break;
     }
 
@@ -518,8 +541,7 @@ export const runCommand = new Command("run")
   .option("--allow-dirty", "Allow running in a dirty git working tree")
   .option(
     "--max-repairs <n>",
-    "Maximum number of repair attempts (0-5)",
-    "2"
+    "Maximum number of repair attempts (0-5); defaults to .forge/config.json"
   )
   .action(async (task: string, options: RunOptions) => {
     await runTask(task, options);
